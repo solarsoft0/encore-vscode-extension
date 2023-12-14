@@ -1,26 +1,126 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
-import * as vscode from 'vscode';
+import * as vscode from "vscode";
+import * as fs from "fs";
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
-export function activate(context: vscode.ExtensionContext) {
+import {
+    EncoreDebugConfigurationProvider,
+    getEncoreGoOverrideFilePath,
+    manualLaunchDebugSession,
+} from "./encore";
+import {
+    MessageType,
+    createFileIfNotExist,
+    deleteFileIfExist,
+    getEncoreExecutablePath,
+    getGoExecutablePath,
+    makeScriptExecutable,
+    showMessage,
+} from "./utils";
 
-	// Use the console to output diagnostic information (console.log) and errors (console.error)
-	// This line of code will only be executed once when your extension is activated
-	console.log('Congratulations, your extension "encore-vscode-extension" is now active!');
+const GO_CONFIG_SECTION = "go";
+const ENCORE_DEBUG_CONFIG_NAME = "encore-debug";
 
-	// The command has been defined in the package.json file
-	// Now provide the implementation of the command with registerCommand
-	// The commandId parameter must match the command field in package.json
-	let disposable = vscode.commands.registerCommand('encore-vscode-extension.helloWorld', () => {
-		// The code you place here will be executed every time your command is executed
-		// Display a message box to the user
-		vscode.window.showInformationMessage('Hello World from Encore VSCode Extension!');
-	});
+async function checkDependencies(): Promise<{
+    isValid: boolean;
+    encoreAppFilePath?: string;
+    goPath?: string;
+}> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
 
-	context.subscriptions.push(disposable);
+    if (!workspaceFolder) {
+        showMessage("No workspace folder found.", MessageType.Error);
+        return { isValid: false };
+    }
+
+    const encoreAppFilePath = workspaceFolder.uri.fsPath;
+    if (!fs.existsSync(`${encoreAppFilePath}/encore.app`)) {
+        showMessage(
+            "encore.app file not found in the workspace.",
+            MessageType.Error
+        );
+        return { isValid: false };
+    }
+
+    const goPath = getGoExecutablePath();
+    if (!goPath) {
+        showMessage("Go not found", MessageType.Error);
+        return { isValid: false };
+    }
+
+    if (!vscode.extensions.getExtension("golang.go")) {
+        vscode.window.showErrorMessage(
+            "The Go extension for Visual Studio Code is not installed."
+        );
+        return { isValid: false };
+    }
+
+    return { isValid: true, encoreAppFilePath, goPath };
 }
 
-// This method is called when your extension is deactivated
-export function deactivate() {}
+function setupEncoreDebugConfiguration(
+    context: vscode.ExtensionContext,
+    goPath: string
+): void {
+    const encoreOverridePath = getEncoreGoOverrideFilePath();
+    const encorePath = getEncoreExecutablePath();
+
+    createFileIfNotExist(
+        encoreOverridePath,
+        `#!/bin/sh
+
+if [ $1 = 'test' ]
+then
+    ${encorePath} $@
+else
+    ${goPath} $@
+fi`
+    );
+
+    makeScriptExecutable(encoreOverridePath);
+
+    const config = vscode.workspace.getConfiguration(GO_CONFIG_SECTION);
+    config.update(
+        "alternateTools",
+        { go: encoreOverridePath },
+        vscode.ConfigurationTarget.Workspace
+    );
+
+    const provider = new EncoreDebugConfigurationProvider();
+    context.subscriptions.push(
+        vscode.debug.registerDebugConfigurationProvider(
+            ENCORE_DEBUG_CONFIG_NAME,
+            provider
+        )
+    );
+}
+
+function registerManualCommand(context: vscode.ExtensionContext): void {
+    const disposable = vscode.commands.registerCommand(
+        "encore.runDebugger",
+        manualLaunchDebugSession
+    );
+    context.subscriptions.push(disposable);
+}
+
+export function activate(context: vscode.ExtensionContext): void {
+    checkDependencies().then((prerequisites) => {
+        if (!prerequisites.isValid) {
+            return;
+        }
+        showMessage("activated");
+        const { goPath } = prerequisites;
+        setupEncoreDebugConfiguration(context, goPath as string); // if valid goPath is definately found.
+        registerManualCommand(context);
+    });
+}
+
+export function deactivate(): void {
+    const encoreOverridePath = getEncoreGoOverrideFilePath();
+    deleteFileIfExist(encoreOverridePath);
+
+    const config = vscode.workspace.getConfiguration(GO_CONFIG_SECTION);
+    config.update(
+        "alternateTools",
+        { go: "" },
+        vscode.ConfigurationTarget.Workspace
+    );
+}
